@@ -1,156 +1,189 @@
-// bot.js – Full AFK bot with walking, breaking, sleeping (Creative mode safe)
+// bot.js – Strip mining, chat commands, sleeping, health server
 const mineflayer = require("mineflayer");
 const express = require("express");
 
-// ========== HEALTH SERVER FOR RENDER ==========
+// ========== HEALTH SERVER ==========
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get("/", (req, res) => res.send("Bot alive"));
 app.get("/health", (req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`[web] Health server on port ${PORT}`));
-// ==============================================
+// ===================================
 
 const config = {
   host: "bax_10.aternos.me",
   port: 55505,
   username: "samadul_gay",
-  auth: "offline",              // for cracked servers
-           // CHANGE to your server's version (1.20.4, 1.21, etc.)
+  auth: "offline",
+  version: "1.20.4",            // match your server
 
-  jumpInterval: 4000,           // jump every 4 sec
-  runInterval: 3000,            // change direction every 3 sec
-  breakInterval: 6000,          // try to break block every 6 sec
-  breakScanRadius: 4,           // max distance to look for breakable blocks
-  breakOnly: ["dirt", "grass_block", "grass", "stone"], // safe blocks
-  sleepCheckInterval: 60000,    // check for bed every 60 sec
-  rejoinInterval: false,        // no forced rejoin
+  // Strip mining settings
+  stripMining: true,            // start strip mining on login
+  tunnelWidth: 1,               // 1 block wide
+  tunnelHeight: 2,              // 2 blocks tall (standard)
+  blocksToMine: ["stone", "deepslate", "dirt", "coal_ore", "iron_ore"],
+  stopWhenFull: true,           // stop if inventory full
+  messageInterval: 10,          // announce every 10 blocks mined
+
+  // Other behaviors
+  jumpInterval: 4000,
+  sleepCheckInterval: 60000,
 };
 
 let bot;
 let afkIntervals = {};
+let stripMiningActive = true;
+let blocksMinedTotal = 0;
+let blocksMinedSinceLastMsg = 0;
 
-// ------------------- Helper: disable creative flight -------------------
-async function ensureMovementWorks() {
-  if (bot.game.gameMode === "creative" && bot.entity?.onGround === false) {
-    console.log("[movement] Creative flight detected, disabling...");
-    try {
-      await bot.creative.stopFlying();
-      console.log("[movement] Flight disabled, now walking");
-    } catch (err) {
-      console.log("[movement] Could not disable flight:", err.message);
+// ------------------- Helper: send chat message -------------------
+function sendMessage(msg) {
+  bot.chat(msg);
+  console.log(`[chat] -> ${msg}`);
+}
+
+// ------------------- Strip Mining Core -------------------
+async function stripMineStep() {
+  if (!stripMiningActive) return;
+  if (bot.isSleeping) return;
+  if (!bot.entity) return;
+
+  // 1. Check inventory space (optional)
+  if (config.stopWhenFull && isInventoryFull()) {
+    sendMessage("Inventory full, stopping mining");
+    stripMiningActive = false;
+    return;
+  }
+
+  // 2. Get blocks to break: head level (y+1) and floor (y)
+  const pos = bot.entity.position;
+  const floorBlock = bot.blockAt(pos.offset(0, 0, 1));   // block in front at feet
+  const headBlock = bot.blockAt(pos.offset(0, 1, 1));    // block in front at head
+
+  const blocksToBreak = [];
+  if (floorBlock && config.blocksToMine.includes(floorBlock.name)) blocksToBreak.push(floorBlock);
+  if (headBlock && config.blocksToMine.includes(headBlock.name)) blocksToBreak.push(headBlock);
+
+  if (blocksToBreak.length === 0) {
+    // No mineable blocks directly ahead – move forward
+    await moveForward();
+    return;
+  }
+
+  // 3. Break blocks in order (head first to avoid falling gravel)
+  for (const block of blocksToBreak) {
+    await breakBlock(block);
+    if (block.name.includes("ore")) {
+      sendMessage(`Found ${block.name}!`);
+    }
+    blocksMinedTotal++;
+    blocksMinedSinceLastMsg++;
+    if (blocksMinedSinceLastMsg >= config.messageInterval) {
+      sendMessage(`Mined ${blocksMinedTotal} blocks total`);
+      blocksMinedSinceLastMsg = 0;
     }
   }
+
+  // 4. Move forward after clearing
+  await moveForward();
 }
 
-// ------------------- Try to sleep at night -------------------
-async function trySleep() {
-  if (bot.isSleeping) return; // already in bed
+async function breakBlock(block) {
+  // Stop movement
+  ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
+  await new Promise(resolve => setTimeout(resolve, 100));
 
+  // Face block
+  await bot.lookAt(block.position);
+
+  // Dig
+  try {
+    await bot.dig(block);
+    console.log(`[mine] Broke ${block.name}`);
+  } catch (err) {
+    console.log(`[mine] Failed to break ${block.name}: ${err.message}`);
+  }
+}
+
+async function moveForward() {
+  // Ensure we are not colliding
+  bot.setControlState("forward", true);
+  await new Promise(resolve => setTimeout(resolve, 800)); // move for 0.8 sec
+  bot.setControlState("forward", false);
+}
+
+function isInventoryFull() {
+  const slots = bot.inventory.slots;
+  const emptySlots = slots.filter(s => s === null).length;
+  return emptySlots < 5; // less than 5 free slots = full
+}
+
+// ------------------- Chat Command Handler -------------------
+function setupChatCommands() {
+  bot.on("chat", (username, message) => {
+    if (username === bot.username) return;
+
+    const cmd = message.toLowerCase();
+    if (cmd === "!start") {
+      stripMiningActive = true;
+      sendMessage("Strip mining resumed");
+    } else if (cmd === "!stop") {
+      stripMiningActive = false;
+      sendMessage("Strip mining paused");
+    } else if (cmd === "!status") {
+      sendMessage(`Mined ${blocksMinedTotal} blocks | Mining: ${stripMiningActive}`);
+    } else if (cmd === "!sleep") {
+      bot.chat("/weather rain"); // just a joke, but you can add manual sleep
+    }
+  });
+}
+
+// ------------------- Sleeping (unchanged from before) -------------------
+async function trySleep() {
+  if (bot.isSleeping) return;
   const time = bot.time.timeOfDay;
   const isNight = time > 13000 && time < 24000;
-  if (!isNight) {
-    console.log("[sleep] Not night, skipping");
-    return;
-  }
+  if (!isNight) return;
 
-  const bed = bot.findBlock({
-    matching: (block) => bot.isABed(block),
-    maxDistance: 16,
-  });
+  const bed = bot.findBlock({ matching: (block) => bot.isABed(block), maxDistance: 16 });
+  if (!bed) return;
 
-  if (!bed) {
-    console.log("[sleep] No bed found within 16 blocks");
-    return;
-  }
-
-  console.log("[sleep] Night time, bed found – sleeping...");
+  sendMessage("Night time, going to sleep");
   try {
     await bot.sleep(bed);
-    console.log("[sleep] Bot is sleeping");
-    // Wake up automatically after 11 seconds (morning)
     setTimeout(() => {
-      if (bot.isSleeping) {
-        bot.wake();
-        console.log("[sleep] Woke up");
-      }
+      if (bot.isSleeping) bot.wake();
     }, 11000);
   } catch (err) {
-    console.log(`[sleep] Failed: ${err.message}`);
+    console.log(`Sleep failed: ${err.message}`);
   }
 }
 
-// ------------------- Try to break a block -------------------
-async function tryBreakBlock() {
-  const targetBlock = bot.findBlock({
-    matching: (block) => {
-      if (!block || block.name === "air") return false;
-      return config.breakOnly.some(name => block.name.toLowerCase().includes(name));
-    },
-    maxDistance: config.breakScanRadius,
-  });
-
-  if (!targetBlock) return;
-
-  const distance = bot.entity.position.distanceTo(targetBlock.position);
-  console.log(`[dig] Found ${targetBlock.name} at distance ${distance.toFixed(2)}`);
-
-  // Stop all movement and wait a moment to avoid drift
-  ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
-  await new Promise(resolve => setTimeout(resolve, 200));
-
-  // Face the block
-  await bot.lookAt(targetBlock.position);
-
-  // Re-check distance (reach is ~4.5 blocks)
-  const newDistance = bot.entity.position.distanceTo(targetBlock.position);
-  if (newDistance > 4.5) {
-    console.log(`[dig] Block out of reach after stopping (${newDistance.toFixed(2)})`);
-    return;
-  }
-
-  console.log(`[dig] Breaking ${targetBlock.name}...`);
-  try {
-    await bot.dig(targetBlock);
-    console.log(`[dig] Successfully broke ${targetBlock.name}`);
-  } catch (err) {
-    console.log(`[dig] Failed: ${err.message}`);
-  }
-}
-
-// ------------------- AFK main loops -------------------
-function startAFK() {
-  // Jump
+// ------------------- AFK & Mining Loops -------------------
+function startBehaviors() {
+  // Jump (optional, can be disabled while mining)
   afkIntervals.jump = setInterval(() => {
-    if (!bot?.entity) return;
+    if (!bot?.entity || stripMiningActive) return; // no jump while strip mining (avoid interrupting)
     bot.setControlState("jump", true);
     setTimeout(() => bot.setControlState("jump", false), 200);
   }, config.jumpInterval);
 
-  // Random movement
-  afkIntervals.move = setInterval(() => {
+  // Strip mining step
+  afkIntervals.mine = setInterval(async () => {
     if (!bot?.entity) return;
-    ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
-    const dir = ["forward", "back", "left", "right"][Math.floor(Math.random() * 4)];
-    bot.setControlState(dir, true);
-    const pos = bot.entity.position;
-    console.log(`[move] ${dir} | pos: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)} | onGround: ${bot.entity.onGround}`);
-  }, config.runInterval);
+    if (stripMiningActive && !bot.isSleeping) {
+      await stripMineStep();
+    }
+  }, 2000); // mine one step every 2 seconds
 
-  // Block breaking
-  afkIntervals.break = setInterval(async () => {
-    if (!bot?.entity) return;
-    await tryBreakBlock();
-  }, config.breakInterval);
-
-  // Sleeping at night
+  // Sleep check
   afkIntervals.sleep = setInterval(async () => {
     if (!bot?.entity) return;
     await trySleep();
   }, config.sleepCheckInterval);
 }
 
-// ------------------- Clean up intervals on disconnect -------------------
-function clearAFKIntervals() {
+function clearIntervals() {
   for (let key in afkIntervals) {
     clearInterval(afkIntervals[key]);
     clearTimeout(afkIntervals[key]);
@@ -158,43 +191,31 @@ function clearAFKIntervals() {
   afkIntervals = {};
 }
 
-// ------------------- Create and manage bot -------------------
+// ------------------- Bot Creation -------------------
 function createBot() {
-  console.log("[bot] Creating bot...");
-  try {
-    bot = mineflayer.createBot({
-      host: config.host,
-      port: config.port,
-      username: config.username,
-      auth: config.auth,
-      version: config.version,
-    });
-  } catch (err) {
-    console.error("[bot] FATAL error on creation:", err);
-    process.exit(1);
-  }
+  bot = mineflayer.createBot({
+    host: config.host,
+    port: config.port,
+    username: config.username,
+    auth: config.auth,
+    version: config.version,
+  });
 
-  bot.once("spawn", async () => {
+  bot.once("spawn", () => {
     console.log(`✅ Bot spawned at ${bot.entity.position}`);
-    console.log(`Gamemode: ${bot.game.gameMode}`);
-    if (isNaN(bot.entity.position.x)) {
-      console.error("[bot] Position NaN – wrong Minecraft version?");
-      bot.quit();
-      return;
-    }
-    await ensureMovementWorks();
-    startAFK();
+    sendMessage("Hello! I am a strip mining bot. Type !start, !stop, !status");
+    setupChatCommands();
+    startBehaviors();
   });
 
   bot.on("end", (reason) => {
-    console.log(`[bot] Disconnected: ${reason || "unknown"}`);
-    clearAFKIntervals();
-    setTimeout(() => createBot(), 10000); // auto-reconnect
+    console.log(`Disconnected: ${reason}`);
+    clearIntervals();
+    setTimeout(() => createBot(), 10000);
   });
 
-  bot.on("kicked", (reason) => console.log("[bot] Kicked:", reason));
-  bot.on("error", (err) => console.log("[bot] Error event:", err));
+  bot.on("kicked", (reason) => console.log("Kicked:", reason));
+  bot.on("error", (err) => console.log("Error:", err));
 }
 
-// ------------------- Start everything -------------------
 createBot();
