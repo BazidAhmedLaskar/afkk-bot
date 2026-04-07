@@ -16,7 +16,7 @@ const config = {
   port: 55505,
   username: "samadul_gay",
   auth: "offline",
-  version: "1.20.4",
+ 
 
   jumpInterval: 4000,
   runInterval: 3000,            // increased to 3 sec per direction
