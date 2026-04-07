@@ -15,7 +15,7 @@ const config = {
   port: 55505,
   username: "samadul_gay",
   auth: "offline",
-  version: "1.20.4",            // match your server
+              // match your server
 
   // Strip mining settings
   stripMining: true,            // start strip mining on login
