@@ -15,7 +15,7 @@ const config = {
   port: 55505,
   username: "samadul_gay",
   auth: "offline",              // for cracked servers
-  version: "1.20.4",            // CHANGE to your server's version (1.20.4, 1.21, etc.)
+           // CHANGE to your server's version (1.20.4, 1.21, etc.)
 
   jumpInterval: 4000,           // jump every 4 sec
   runInterval: 3000,            // change direction every 3 sec
