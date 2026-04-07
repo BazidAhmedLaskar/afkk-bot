@@ -1,6 +1,7 @@
-// bot.js – fully functional AFK mining bot
+// bot.js – guaranteed walking + creative flight fix
 const mineflayer = require("mineflayer");
 const express = require("express");
+const Vec3 = require("vec3");
 
 // ========== HEALTH SERVER ==========
 const app = express();
@@ -15,18 +16,31 @@ const config = {
   port: 55505,
   username: "samadul_gay",
   auth: "offline",
-  version: "1.20.4",           // change to your server's version
+  version: "1.20.4",
 
-  jumpInterval: 4000,          // jump every 4 seconds
-  runInterval: 1500,           // change direction every 1.5 sec
-  breakInterval: 5000,         // try to break a block every 5 sec
+  jumpInterval: 4000,
+  runInterval: 3000,            // increased to 3 sec per direction
+  breakInterval: 5000,
   breakScanRadius: 5,
   breakOnly: ["dirt", "grass_block", "grass", "stone"],
-  rejoinInterval: false,       // no forced rejoin
+  rejoinInterval: false,
 };
 
 let bot;
 let afkIntervals = {};
+
+async function ensureMovementWorks() {
+  // If bot is in creative mode and flying, disable flight
+  if (bot.game.gameMode === "creative" && bot.entity?.onGround === false) {
+    console.log("[movement] Creative flight detected, disabling...");
+    try {
+      await bot.creative.stopFlying();
+      console.log("[movement] Flight disabled, now on ground");
+    } catch (err) {
+      console.log("[movement] Could not disable flight:", err.message);
+    }
+  }
+}
 
 function createBot() {
   console.log("[bot] Attempting to create bot...");
@@ -38,14 +52,16 @@ function createBot() {
       auth: config.auth,
       version: config.version,
     });
-    console.log("[bot] Bot object created, waiting for events...");
   } catch (err) {
     console.error("[bot] FATAL error:", err);
     process.exit(1);
   }
 
-  bot.once("login", () => {
+  bot.once("login", async () => {
     console.log(`✅✅✅ BOT JOINED as ${bot.username} ✅✅✅`);
+    // Wait a bit for the world to load
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await ensureMovementWorks();
     startAFK();
   });
 
@@ -75,23 +91,28 @@ function startAFK() {
     setTimeout(() => bot.setControlState("jump", false), 200);
   }, config.jumpInterval);
 
-  // Random movement loop
+  // Random movement loop (with debug)
   afkIntervals.move = setInterval(() => {
     if (!bot?.entity) return;
-    // Reset all movement keys
+    
+    // Reset all movement
     ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
+    
+    // Choose random direction
     const dir = ["forward", "back", "left", "right"][Math.floor(Math.random() * 4)];
     bot.setControlState(dir, true);
-    console.log(`[movement] moving ${dir}`);
+    
+    // Log position and direction to confirm movement
+    const pos = bot.entity.position;
+    console.log(`[movement] ${dir} | pos: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)} | onGround: ${bot.entity.onGround}`);
   }, config.runInterval);
 
-  // Block breaking loop
+  // Block breaking loop (unchanged)
   afkIntervals.break = setInterval(async () => {
     if (!bot?.entity) return;
     await tryBreakBlock();
   }, config.breakInterval);
 
-  // Optional rejoin (disabled)
   if (config.rejoinInterval && config.rejoinInterval > 0) {
     afkIntervals.rejoin = setTimeout(() => {
       console.log("[rejoin] Forcing rejoin...");
@@ -126,7 +147,6 @@ async function tryBreakBlock() {
   const distance = bot.entity.position.distanceTo(targetBlock.position);
   console.log(`[break] Found ${targetBlock.name} at distance ${distance.toFixed(2)}. Breaking...`);
 
-  // Pause movement while digging
   const savedMovements = ["forward", "back", "left", "right"].filter(d => bot.getControlState(d));
   savedMovements.forEach(d => bot.setControlState(d, false));
 
@@ -136,10 +156,8 @@ async function tryBreakBlock() {
   } catch (err) {
     console.log(`[break] Failed: ${err.message}`);
   } finally {
-    // Restore movement
     savedMovements.forEach(d => bot.setControlState(d, true));
   }
 }
 
-// Start the bot
 createBot();
