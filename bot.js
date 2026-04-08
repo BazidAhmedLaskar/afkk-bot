@@ -11,7 +11,7 @@ app.listen(PORT, () => console.log(`[web] Health server on port ${PORT}`));
 // ==============================================
 
 const config = {
-  host: "bax10.aternos.me",      // ✅ FIXED: removed underscore
+  host: "bax_10.aternos.me",      // ✅ FIXED: removed underscore
   port: 55505,
   username: "samadul_gay",
   auth: "offline",
