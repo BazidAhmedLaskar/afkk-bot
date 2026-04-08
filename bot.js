@@ -11,25 +11,25 @@ app.listen(PORT, () => console.log(`[web] Health server on port ${PORT}`));
 // ==============================================
 
 const config = {
-  host: "bax_10.aternos.me",
+  host: "bax10.aternos.me",      // ✅ FIXED: removed underscore
   port: 55505,
   username: "samadul_gay",
   auth: "offline",
 
   // Strip mining settings
-  stripMining: true,               // start strip mining on login
+  stripMining: true,
   blocksToMine: ["stone", "deepslate", "dirt", "coal_ore", "iron_ore", "cobblestone"],
-  stopWhenFull: true,              // stop if inventory full
-  messageInterval: 10,             // announce every 10 blocks mined
-  mineStepInterval: 2000,          // mine one step every 2 seconds
-  moveForwardTime: 800,            // ms to hold forward after clearing
+  stopWhenFull: true,
+  messageInterval: 10,
+  mineStepInterval: 2000,
+  moveForwardTime: 800,
 };
 
 let bot;
-let afkIntervals = {};
 let stripMiningActive = true;
 let blocksMinedTotal = 0;
 let blocksMinedSinceLastMsg = 0;
+let miningLoopRunning = false;
 
 // ------------------- Helper: send chat message -------------------
 function sendMessage(msg) {
@@ -41,19 +41,16 @@ function sendMessage(msg) {
 function isInventoryFull() {
   const slots = bot.inventory.slots;
   const emptySlots = slots.filter(s => s === null).length;
-  return emptySlots < 5; // less than 5 free slots = full
+  return emptySlots < 5;
 }
 
 // ------------------- Break a single block -------------------
 async function breakBlock(block) {
-  // Stop movement
   ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
   await new Promise(resolve => setTimeout(resolve, 100));
 
-  // Face the block
   await bot.lookAt(block.position);
 
-  // Dig
   try {
     await bot.dig(block);
     console.log(`[mine] Broke ${block.name}`);
@@ -73,10 +70,8 @@ async function moveForward() {
 
 // ------------------- Strip mining step -------------------
 async function stripMineStep() {
-  if (!stripMiningActive) return;
-  if (!bot.entity) return;
+  if (!stripMiningActive || !bot.entity) return;
 
-  // Stop if inventory full
   if (config.stopWhenFull && isInventoryFull()) {
     sendMessage("Inventory full, stopping mining");
     stripMiningActive = false;
@@ -84,21 +79,23 @@ async function stripMineStep() {
   }
 
   const pos = bot.entity.position;
-  // Blocks directly ahead: at feet (y) and at head (y+1)
-  const floorBlock = bot.blockAt(pos.offset(0, 0, 1));
-  const headBlock = bot.blockAt(pos.offset(0, 1, 1));
+  const yaw = bot.entity.yaw;
+  // Calculate forward direction vector based on yaw
+  const forwardX = -Math.sin(yaw);
+  const forwardZ = -Math.cos(yaw);
+
+  const floorBlock = bot.blockAt(pos.offset(forwardX, 0, forwardZ));
+  const headBlock  = bot.blockAt(pos.offset(forwardX, 1, forwardZ));
 
   const blocksToBreak = [];
   if (floorBlock && config.blocksToMine.includes(floorBlock.name)) blocksToBreak.push(floorBlock);
   if (headBlock && config.blocksToMine.includes(headBlock.name)) blocksToBreak.push(headBlock);
 
   if (blocksToBreak.length === 0) {
-    // No mineable blocks ahead – just move forward
     await moveForward();
     return;
   }
 
-  // Break blocks (head first to avoid falling blocks)
   for (const block of blocksToBreak) {
     const success = await breakBlock(block);
     if (success) {
@@ -114,11 +111,21 @@ async function stripMineStep() {
     }
   }
 
-  // Move forward into the cleared space
   await moveForward();
 }
 
-// ------------------- Chat command handler -------------------
+// ------------------- Mining loop (no overlapping) -------------------
+async function miningLoop() {
+  if (miningLoopRunning) return;
+  miningLoopRunning = true;
+  while (stripMiningActive) {
+    await stripMineStep();
+    await new Promise(resolve => setTimeout(resolve, config.mineStepInterval));
+  }
+  miningLoopRunning = false;
+}
+
+// ------------------- Chat commands -------------------
 function setupChatCommands() {
   bot.on("chat", (username, message) => {
     if (username === bot.username) return;
@@ -126,6 +133,7 @@ function setupChatCommands() {
     if (cmd === "!start") {
       stripMiningActive = true;
       sendMessage("Strip mining resumed");
+      miningLoop(); // restart loop if stopped
     } else if (cmd === "!stop") {
       stripMiningActive = false;
       sendMessage("Strip mining paused");
@@ -133,27 +141,6 @@ function setupChatCommands() {
       sendMessage(`Mined ${blocksMinedTotal} blocks | Mining: ${stripMiningActive}`);
     }
   });
-}
-
-// ------------------- Main AFK loops (no sleep) -------------------
-function startBehaviors() {
-  // Strip mining loop
-  afkIntervals.mine = setInterval(async () => {
-    if (!bot?.entity) return;
-    await stripMineStep();
-  }, config.mineStepInterval);
-
-  // Optional: small jump every now and then (but not while mining to avoid interruption)
-  // If you want occasional jumping even while mining, you can add it here, but it may disrupt.
-  // For now, no jumping to keep mining smooth.
-}
-
-function clearIntervals() {
-  for (let key in afkIntervals) {
-    clearInterval(afkIntervals[key]);
-    clearTimeout(afkIntervals[key]);
-  }
-  afkIntervals = {};
 }
 
 // ------------------- Bot creation -------------------
@@ -165,7 +152,7 @@ function createBot() {
       port: config.port,
       username: config.username,
       auth: config.auth,
-      version: config.version,
+      // ✅ version field REMOVED – Mineflayer auto-detects
     });
   } catch (err) {
     console.error("[bot] FATAL error:", err);
@@ -174,14 +161,16 @@ function createBot() {
 
   bot.once("spawn", () => {
     console.log(`✅ Bot spawned at ${bot.entity.position}`);
+    // ✅ FIX: Face south (+Z) so forward = +Z
+    bot.look(0, 0, true); // yaw=0, pitch=0
     sendMessage("Strip mining bot active! Commands: !start, !stop, !status");
     setupChatCommands();
-    startBehaviors();
+    miningLoop();
   });
 
   bot.on("end", (reason) => {
     console.log(`[bot] Disconnected: ${reason || "unknown"}`);
-    clearIntervals();
+    stripMiningActive = false; // stop loop on disconnect
     setTimeout(() => createBot(), 10000);
   });
 
