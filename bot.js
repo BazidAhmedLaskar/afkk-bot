@@ -14,9 +14,9 @@ app.listen(PORT, () => console.log(`[web] Health server on port ${PORT}`));
 const config = {
   host: "bax_10.aternos.me",
   port: 55505,
-  username: "samadul_gay",
+  username: "sidli_porn",
   auth: "offline",
-  version: "1.20.4",           // CHANGE THIS to your server's version (e.g., "1.19.2", "1.20.4")
+            // CHANGE THIS to your server's version (e.g., "1.19.2", "1.20.4")
 
   diamondLevelY: -59,
   stopWhenFull: true,
