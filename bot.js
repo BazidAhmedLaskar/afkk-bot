@@ -1,181 +1,380 @@
-// bot.js – Strip mining, chat commands, health server (no sleep)
+// bot.js – Netherite mining bot: only collects coal, iron, diamond ores
 const mineflayer = require("mineflayer");
+const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
 const express = require("express");
 
-// ========== HEALTH SERVER FOR RENDER ==========
+// ========== HEALTH SERVER ==========
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get("/", (req, res) => res.send("Bot alive"));
 app.get("/health", (req, res) => res.status(200).send("OK"));
 app.listen(PORT, () => console.log(`[web] Health server on port ${PORT}`));
-// ==============================================
 
+// ========== CONFIGURATION ==========
 const config = {
-  host: "bax_10.aternos.me",      // ✅ FIXED: removed underscore
+  host: "bax_10.aternos.me",
   port: 55505,
-  username: "samadul_gay",
+  username: "sidli_porn",
   auth: "offline",
 
-  // Strip mining settings
-  stripMining: true,
-  blocksToMine: ["stone", "deepslate", "dirt", "coal_ore", "iron_ore", "cobblestone"],
-  stopWhenFull: true,
-  messageInterval: 10,
-  mineStepInterval: 2000,
+  diamondLevelY: -59,
+  stopWhenFull: true, // stop when inventory has less than 5 empty slots
+  messageInterval: 5, // announce ore count every 5 ores
+
+  // Only these ores will be counted and reported
+  valuableOres: ["coal_ore", "iron_ore", "diamond_ore"],
+
+  // Diamond handling
+  autoGiveDiamonds: true,
+  autoStoreInChest: false, // set to true if you have a chest
+  chestPosition: { x: 0, y: 64, z: 0 },
+  returnToMineAfterChest: true,
+
+  sleepCheckInterval: 60000,
   moveForwardTime: 800,
 };
 
 let bot;
-let stripMiningActive = true;
-let blocksMinedTotal = 0;
-let blocksMinedSinceLastMsg = 0;
-let miningLoopRunning = false;
+let afkIntervals = {};
+let valuableOreCount = 0; // total count of coal/iron/diamond ores mined
+let oresSinceLastMsg = 0;
+let diamondCount = 0;
 
-// ------------------- Helper: send chat message -------------------
+// State machine
+let currentPhase = "descending";
+let miningOrigin = null;
+
 function sendMessage(msg) {
   bot.chat(msg);
   console.log(`[chat] -> ${msg}`);
 }
 
-// ------------------- Inventory check -------------------
+// ========== INVENTORY HELPERS ==========
+function countDiamondsInInventory() {
+  let count = 0;
+  for (const item of bot.inventory.items()) {
+    if (item.name === "diamond") count += item.count;
+  }
+  return count;
+}
+
 function isInventoryFull() {
-  const slots = bot.inventory.slots;
-  const emptySlots = slots.filter(s => s === null).length;
+  const emptySlots = bot.inventory.slots.filter((s) => s === null).length;
   return emptySlots < 5;
 }
 
-// ------------------- Break a single block -------------------
-async function breakBlock(block) {
-  ["forward", "back", "left", "right"].forEach(d => bot.setControlState(d, false));
-  await new Promise(resolve => setTimeout(resolve, 100));
+// ========== BLOCK HELPERS ==========
+function isFallingBlock(block) {
+  return (
+    block &&
+    (block.name === "gravel" ||
+      block.name === "sand" ||
+      block.name === "red_sand")
+  );
+}
 
+function isUnbreakable(block) {
+  if (!block) return true;
+  return ["bedrock", "lava", "water", "air"].includes(block.name);
+}
+
+function isSolid(block) {
+  return block && block.boundingBox === "block" && block.name !== "air";
+}
+
+function isValuableOre(block) {
+  return block && config.valuableOres.includes(block.name);
+}
+
+// ========== CORE MINING ==========
+async function breakBlock(block) {
+  if (!block || isUnbreakable(block)) return false;
+
+  ["forward", "back", "left", "right"].forEach((d) =>
+    bot.setControlState(d, false)
+  );
+  await new Promise((r) => setTimeout(r, 50));
   await bot.lookAt(block.position);
 
+  const isFalling = isFallingBlock(block);
   try {
     await bot.dig(block);
     console.log(`[mine] Broke ${block.name}`);
+
+    // Count only valuable ores
+    if (isValuableOre(block)) {
+      valuableOreCount++;
+      oresSinceLastMsg++;
+      if (oresSinceLastMsg >= config.messageInterval) {
+        sendMessage(`⛏️ Mined ${valuableOreCount} valuable ores so far`);
+        oresSinceLastMsg = 0;
+      }
+      // Special diamond tracking
+      if (block.name === "diamond_ore") {
+        sendMessage(`💎 Diamond ore found!`);
+      }
+    }
+
+    if (isFalling) {
+      bot.setControlState("back", true);
+      await new Promise((r) => setTimeout(r, 300));
+      bot.setControlState("back", false);
+    }
     return true;
   } catch (err) {
-    console.log(`[mine] Failed to break ${block.name}: ${err.message}`);
+    console.log(`[mine] Failed: ${err.message}`);
     return false;
   }
 }
 
-// ------------------- Move forward one step -------------------
 async function moveForward() {
+  const pos = bot.entity.position;
+  const frontFeet = bot.blockAt(pos.offset(0, 0, 1));
+  const frontHead = bot.blockAt(pos.offset(0, 1, 1));
+  if (isSolid(frontFeet) || isSolid(frontHead)) return; // still blocked
+
   bot.setControlState("forward", true);
-  await new Promise(resolve => setTimeout(resolve, config.moveForwardTime));
+  await new Promise((r) => setTimeout(r, config.moveForwardTime));
   bot.setControlState("forward", false);
 }
 
-// ------------------- Strip mining step -------------------
-async function stripMineStep() {
-  if (!stripMiningActive || !bot.entity) return;
+// ========== DIAMOND HANDLING ==========
+async function giveDiamondsToNearestPlayer() {
+  const players = Object.values(bot.players).filter(
+    (p) => p.entity && p.username !== bot.username
+  );
+  if (players.length === 0) return false;
+  let closest = null,
+    closestDist = 10;
+  for (const p of players) {
+    const dist = bot.entity.position.distanceTo(p.entity.position);
+    if (dist < closestDist) {
+      closestDist = dist;
+      closest = p;
+    }
+  }
+  if (!closest) return false;
+  const diamonds = bot.inventory.items().filter((i) => i.name === "diamond");
+  if (diamonds.length === 0) return false;
+  const total = diamonds.reduce((s, i) => s + i.count, 0);
+  sendMessage(`🎁 Giving ${total} diamonds to ${closest.username}`);
+  for (const item of diamonds) await bot.toss(item.type, null, item.count);
+  return true;
+}
 
+async function storeDiamondsInChest() {
+  if (!config.chestPosition) return false;
+  const chestBlock = bot.blockAt(config.chestPosition);
+  if (!chestBlock || !bot.isChest(chestBlock)) return false;
+  sendMessage(`Going to chest...`);
+  await bot.pathfinder.goto(
+    new goals.GoalBlock(
+      config.chestPosition.x,
+      config.chestPosition.y,
+      config.chestPosition.z
+    )
+  );
+  const chest = await bot.openChest(chestBlock);
+  const diamonds = bot.inventory.items().filter((i) => i.name === "diamond");
+  for (const item of diamonds) await chest.deposit(item.type, null, item.count);
+  sendMessage(
+    `Deposited ${diamonds.reduce((s, i) => s + i.count, 0)} diamonds`
+  );
+  await chest.close();
+  return true;
+}
+
+// ========== DESCENT (staircase) ==========
+async function descendStep() {
+  if (currentPhase !== "descending") return;
+  if (bot.isSleeping) return;
+  if (bot.entity.position.y <= config.diamondLevelY) {
+    sendMessage(`✅ Reached diamond level. Starting strip mining.`);
+    currentPhase = "stripMining";
+    miningOrigin = bot.entity.position.floored();
+    return;
+  }
+  const pos = bot.entity.position;
+  const feet = bot.blockAt(pos.offset(0, 0, 1));
+  const head = bot.blockAt(pos.offset(0, 1, 1));
+  const below = bot.blockAt(pos.offset(0, -1, 1));
+  if (isSolid(feet)) await breakBlock(feet);
+  if (isSolid(head)) await breakBlock(head);
+  if (isSolid(below)) await breakBlock(below);
+  bot.setControlState("forward", true);
+  await new Promise((r) => setTimeout(r, 500));
+  bot.setControlState("forward", false);
+  const newFeet = bot.blockAt(bot.entity.position.offset(0, 0, 1));
+  if (newFeet && newFeet.name === "air") {
+    bot.setControlState("sneak", true);
+    bot.setControlState("forward", true);
+    await new Promise((r) => setTimeout(r, 400));
+    bot.setControlState("forward", false);
+    bot.setControlState("sneak", false);
+  }
+}
+
+// ========== STRIP MINING ==========
+async function stripMineStep() {
+  if (currentPhase !== "stripMining") return;
+  if (bot.isSleeping) return;
+  if (bot.entity.position.y > config.diamondLevelY + 2) {
+    currentPhase = "descending";
+    return;
+  }
   if (config.stopWhenFull && isInventoryFull()) {
-    sendMessage("Inventory full, stopping mining");
-    stripMiningActive = false;
+    sendMessage("Inventory full, stopping mining.");
+    currentPhase = "idle";
     return;
   }
 
+  // Diamond inventory check
+  const currentDiamonds = countDiamondsInInventory();
+  if (currentDiamonds > diamondCount) {
+    const gained = currentDiamonds - diamondCount;
+    diamondCount = currentDiamonds;
+    sendMessage(`💎 Now carrying ${diamondCount} diamonds`);
+    if (config.autoGiveDiamonds) {
+      if (await giveDiamondsToNearestPlayer())
+        diamondCount = countDiamondsInInventory();
+    }
+    if (
+      !config.autoGiveDiamonds &&
+      config.autoStoreInChest &&
+      diamondCount >= 5
+    ) {
+      currentPhase = "returningToChest";
+      return;
+    }
+  }
+
   const pos = bot.entity.position;
-  const yaw = bot.entity.yaw;
-  // Calculate forward direction vector based on yaw
-  const forwardX = -Math.sin(yaw);
-  const forwardZ = -Math.cos(yaw);
+  const feetBlock = bot.blockAt(pos.offset(0, 0, 1));
+  const headBlock = bot.blockAt(pos.offset(0, 1, 1));
+  const passable = (b) => !b || b.name === "air" || b.boundingBox !== "block";
 
-  const floorBlock = bot.blockAt(pos.offset(forwardX, 0, forwardZ));
-  const headBlock  = bot.blockAt(pos.offset(forwardX, 1, forwardZ));
-
-  const blocksToBreak = [];
-  if (floorBlock && config.blocksToMine.includes(floorBlock.name)) blocksToBreak.push(floorBlock);
-  if (headBlock && config.blocksToMine.includes(headBlock.name)) blocksToBreak.push(headBlock);
-
-  if (blocksToBreak.length === 0) {
+  if (passable(feetBlock) && passable(headBlock)) {
     await moveForward();
     return;
   }
 
-  for (const block of blocksToBreak) {
-    const success = await breakBlock(block);
-    if (success) {
-      blocksMinedTotal++;
-      blocksMinedSinceLastMsg++;
-      if (block.name.includes("ore")) {
-        sendMessage(`Found ${block.name}!`);
-      }
-      if (blocksMinedSinceLastMsg >= config.messageInterval) {
-        sendMessage(`Mined ${blocksMinedTotal} blocks total`);
-        blocksMinedSinceLastMsg = 0;
-      }
-    }
-  }
-
+  // Break head first, then feet
+  if (headBlock && !passable(headBlock)) await breakBlock(headBlock);
+  if (feetBlock && !passable(feetBlock)) await breakBlock(feetBlock);
   await moveForward();
 }
 
-// ------------------- Mining loop (no overlapping) -------------------
-async function miningLoop() {
-  if (miningLoopRunning) return;
-  miningLoopRunning = true;
-  while (stripMiningActive) {
-    await stripMineStep();
-    await new Promise(resolve => setTimeout(resolve, config.mineStepInterval));
+// ========== CHEST RETURN ==========
+async function returnToChestAndBack() {
+  if (currentPhase !== "returningToChest") return;
+  if (await storeDiamondsInChest()) {
+    diamondCount = 0;
+    if (config.returnToMineAfterChest && miningOrigin) {
+      await bot.pathfinder.goto(
+        new goals.GoalBlock(miningOrigin.x, miningOrigin.y, miningOrigin.z)
+      );
+    }
   }
-  miningLoopRunning = false;
+  currentPhase = "stripMining";
 }
 
-// ------------------- Chat commands -------------------
+// ========== SLEEP ==========
+async function trySleep() {
+  if (bot.isSleeping) return;
+  const time = bot.time.timeOfDay;
+  if (time < 13000 || time > 24000) return;
+  const bed = bot.findBlock({
+    matching: (b) => bot.isABed(b),
+    maxDistance: 16,
+  });
+  if (!bed) return;
+  sendMessage("Night time, sleeping...");
+  try {
+    await bot.sleep(bed);
+    setTimeout(() => {
+      if (bot.isSleeping) bot.wake();
+    }, 11000);
+  } catch (err) {
+    console.log(`Sleep failed: ${err.message}`);
+  }
+}
+
+// ========== CHAT COMMANDS ==========
 function setupChatCommands() {
-  bot.on("chat", (username, message) => {
+  bot.on("chat", async (username, message) => {
     if (username === bot.username) return;
     const cmd = message.toLowerCase();
     if (cmd === "!start") {
-      stripMiningActive = true;
-      sendMessage("Strip mining resumed");
-      miningLoop(); // restart loop if stopped
+      currentPhase = "stripMining";
+      sendMessage("Resumed mining");
     } else if (cmd === "!stop") {
-      stripMiningActive = false;
-      sendMessage("Strip mining paused");
+      currentPhase = "idle";
+      sendMessage("Paused");
     } else if (cmd === "!status") {
-      sendMessage(`Mined ${blocksMinedTotal} blocks | Mining: ${stripMiningActive}`);
+      sendMessage(
+        `Phase: ${currentPhase} | Ores mined: ${valuableOreCount} | Diamonds: ${diamondCount}`
+      );
+    } else if (cmd === "!descend") {
+      currentPhase = "descending";
+      sendMessage("Descending");
+    } else if (cmd === "!diamonds") {
+      if (await giveDiamondsToNearestPlayer())
+        diamondCount = countDiamondsInInventory();
+      else sendMessage("No diamonds or player nearby");
+    } else if (cmd === "!chest") {
+      currentPhase = "returningToChest";
     }
   });
 }
 
-// ------------------- Bot creation -------------------
+// ========== LOOPS ==========
+function startBehaviors() {
+  afkIntervals.mine = setInterval(async () => {
+    if (!bot?.entity || bot.isSleeping) return;
+    if (currentPhase === "descending") await descendStep();
+    else if (currentPhase === "stripMining") await stripMineStep();
+    else if (currentPhase === "returningToChest") await returnToChestAndBack();
+  }, 2000);
+  afkIntervals.sleep = setInterval(async () => {
+    if (bot?.entity) await trySleep();
+  }, config.sleepCheckInterval);
+}
+
+function clearIntervals() {
+  for (let key in afkIntervals) clearInterval(afkIntervals[key]);
+  afkIntervals = {};
+}
+
+// ========== BOT START ==========
 function createBot() {
-  console.log("[bot] Creating bot...");
-  try {
-    bot = mineflayer.createBot({
-      host: config.host,
-      port: config.port,
-      username: config.username,
-      auth: config.auth,
-      // ✅ version field REMOVED – Mineflayer auto-detects
-    });
-  } catch (err) {
-    console.error("[bot] FATAL error:", err);
-    process.exit(1);
-  }
-
-  bot.once("spawn", () => {
-    console.log(`✅ Bot spawned at ${bot.entity.position}`);
-    // ✅ FIX: Face south (+Z) so forward = +Z
-    bot.look(0, 0, true); // yaw=0, pitch=0
-    sendMessage("Strip mining bot active! Commands: !start, !stop, !status");
-    setupChatCommands();
-    miningLoop();
+  bot = mineflayer.createBot({
+    host: config.host,
+    port: config.port,
+    username: config.username,
+    auth: config.auth,
   });
-
+  bot.loadPlugin(pathfinder);
+  bot.once("spawn", () => {
+    const mcData = require("minecraft-data")(bot.version);
+    const moves = new Movements(bot, mcData);
+    moves.allowParkour = false;
+    moves.canDig = false;
+    bot.pathfinder.setMovements(moves);
+    console.log(`✅ Bot ready at ${bot.entity.position}`);
+    sendMessage(
+      "Netherite mining bot online – mining only coal, iron, diamond ores. Commands: !start, !stop, !status, !descend, !diamonds, !chest"
+    );
+    setupChatCommands();
+    startBehaviors();
+    currentPhase = "descending";
+  });
   bot.on("end", (reason) => {
-    console.log(`[bot] Disconnected: ${reason || "unknown"}`);
-    stripMiningActive = false; // stop loop on disconnect
+    console.log(`Disconnected: ${reason}`);
+    clearIntervals();
     setTimeout(() => createBot(), 10000);
   });
-
-  bot.on("kicked", (reason) => console.log("[bot] Kicked:", reason));
-  bot.on("error", (err) => console.log("[bot] Error event:", err));
+  bot.on("kicked", (reason) => console.log("Kicked:", reason));
+  bot.on("error", (err) => console.log("Error:", err));
 }
 
 createBot();
